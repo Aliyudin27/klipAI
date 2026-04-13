@@ -1,0 +1,2 @@
+# klipAI
+buat klipping
