@@ -11,17 +11,30 @@ require('dotenv').config();
 const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 8001;
-const TEMP_DIR = process.env.TEMP_DIR || '/tmp/video-clipper';
+const TEMP_DIR = process.env.TEMP_DIR || path.join(__dirname, 'temp');
 
-// Middleware
-app.use(cors());
+// Middleware - CORS configured for localhost:3000
+app.use(cors({
+  origin: 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
 
 // Store job status in memory (stateless - will be reset on server restart)
 const jobs = new Map();
 
-// Initialize Gemini AI
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Initialize Gemini AI with proper error handling
+let genAI = null;
+try {
+  if (process.env.GEMINI_API_KEY) {
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    console.log('✅ Gemini API initialized');
+  } else {
+    console.warn('⚠️  GEMINI_API_KEY not found in environment');
+  }
+} catch (error) {
+  console.error('❌ Failed to initialize Gemini AI:', error.message);
+}
 
 // Ensure temp directory exists
 async function ensureTempDir() {
@@ -30,6 +43,18 @@ async function ensureTempDir() {
     console.log('✅ Temp directory created:', TEMP_DIR);
   } catch (error) {
     console.error('Error creating temp directory:', error);
+  }
+}
+
+// Clean up specific job folder
+async function cleanupJobFolder(jobId) {
+  try {
+    const jobDir = path.join(TEMP_DIR, jobId);
+    await fs.rm(jobDir, { recursive: true, force: true });
+    jobs.delete(jobId);
+    console.log('🗑️  Cleaned up job folder:', jobId);
+  } catch (error) {
+    console.error('Cleanup error for job', jobId, ':', error.message);
   }
 }
 
@@ -42,15 +67,23 @@ async function cleanupOldFiles() {
 
     for (const file of files) {
       const filePath = path.join(TEMP_DIR, file);
-      const stats = await fs.stat(filePath);
-      
-      if (now - stats.mtimeMs > oneHour) {
-        await fs.unlink(filePath);
-        console.log('🗑️  Cleaned up old file:', file);
+      try {
+        const stats = await fs.stat(filePath);
+        
+        if (now - stats.mtimeMs > oneHour) {
+          if (stats.isDirectory()) {
+            await fs.rm(filePath, { recursive: true, force: true });
+          } else {
+            await fs.unlink(filePath);
+          }
+          console.log('🗑️  Cleaned up old file/folder:', file);
+        }
+      } catch (statError) {
+        console.error('Error checking file stats:', statError.message);
       }
     }
   } catch (error) {
-    console.error('Error during cleanup:', error);
+    console.error('Error during cleanup:', error.message);
   }
 }
 
@@ -59,7 +92,12 @@ setInterval(cleanupOldFiles, 30 * 60 * 1000);
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Video Clipper API is running' });
+  res.json({ 
+    status: 'ok', 
+    message: 'Video Clipper API is running',
+    geminiConfigured: !!genAI,
+    tempDir: TEMP_DIR
+  });
 });
 
 // Download video and extract transcript
@@ -84,12 +122,18 @@ app.post('/api/download', async (req, res) => {
 
     res.json({ jobId, status: 'downloading' });
 
-    // Download video with yt-dlp
+    // Download video with yt-dlp - FIXED with user-agent and no-check-certificate
     const videoPath = path.join(outputDir, 'video.mp4');
-    const downloadCmd = `yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${videoPath}" "${url}"`;
+    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    
+    // Enhanced yt-dlp command to avoid YouTube bot detection
+    const downloadCmd = `yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 --no-check-certificate --user-agent "${userAgent}" -o "${videoPath}" "${url}"`;
     
     console.log('📥 Downloading video:', url);
-    await execAsync(downloadCmd);
+    await execAsync(downloadCmd, { 
+      maxBuffer: 100 * 1024 * 1024,
+      timeout: 300000 // 5 minute timeout
+    });
 
     jobs.set(jobId, {
       status: 'extracting',
@@ -97,11 +141,13 @@ app.post('/api/download', async (req, res) => {
       message: 'Extracting transcript...'
     });
 
-    // Extract subtitles/transcript
+    // Extract subtitles/transcript with fallback handling
     const subtitlesPath = path.join(outputDir, 'subtitles.txt');
+    let transcriptExtracted = false;
+    
     try {
-      const subtitlesCmd = `yt-dlp --skip-download --write-auto-subs --sub-lang en --sub-format vtt --convert-subs srt -o "${path.join(outputDir, 'subs')}" "${url}"`;
-      await execAsync(subtitlesCmd);
+      const subtitlesCmd = `yt-dlp --skip-download --write-auto-subs --sub-lang en --sub-format vtt --convert-subs srt --no-check-certificate --user-agent "${userAgent}" -o "${path.join(outputDir, 'subs')}" "${url}"`;
+      await execAsync(subtitlesCmd, { timeout: 60000 }); // 1 minute timeout for subtitles
       
       // Try to read the subtitle file
       const srtFiles = (await fs.readdir(outputDir)).filter(f => f.endsWith('.srt'));
@@ -117,21 +163,29 @@ app.post('/api/download', async (req, res) => {
           .filter(text => text.trim())
           .join(' ');
         
-        await fs.writeFile(subtitlesPath, transcript);
-        console.log('✅ Transcript extracted');
-      } else {
-        // If no subtitles available, create a placeholder
-        await fs.writeFile(subtitlesPath, 'No transcript available for this video.');
-        console.log('⚠️  No transcript available');
+        if (transcript.trim()) {
+          await fs.writeFile(subtitlesPath, transcript);
+          transcriptExtracted = true;
+          console.log('✅ Transcript extracted');
+        }
       }
     } catch (error) {
       console.log('⚠️  Could not extract transcript:', error.message);
-      await fs.writeFile(subtitlesPath, 'No transcript available for this video.');
+    }
+    
+    // If transcript extraction failed, create a descriptive placeholder
+    if (!transcriptExtracted) {
+      await fs.writeFile(subtitlesPath, 'No transcript available for this video. Subtitles may not be available or the video may not have captions.');
+      console.log('⚠️  No transcript available - using fallback');
     }
 
-    // Get video duration
-    const durationCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`;
-    const { stdout: durationOutput } = await execAsync(durationCmd);
+    // Get video duration - handle both Windows and Unix paths
+    const escapedVideoPath = process.platform === 'win32' 
+      ? videoPath.replace(/\\/g, '/')
+      : videoPath;
+    
+    const durationCmd = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${escapedVideoPath}"`;
+    const { stdout: durationOutput } = await execAsync(durationCmd, { timeout: 30000 });
     const duration = parseFloat(durationOutput.trim());
 
     jobs.set(jobId, {
@@ -140,7 +194,8 @@ app.post('/api/download', async (req, res) => {
       message: 'Download complete',
       videoPath,
       subtitlesPath,
-      duration
+      duration,
+      transcriptAvailable: transcriptExtracted
     });
 
     console.log('✅ Download complete. Duration:', duration, 'seconds');
@@ -150,12 +205,15 @@ app.post('/api/download', async (req, res) => {
     jobs.set(jobId, {
       status: 'error',
       progress: 0,
-      message: error.message
+      message: error.message || 'Failed to download video'
     });
+    
+    // Cleanup failed job folder
+    setTimeout(() => cleanupJobFolder(jobId), 5000);
   }
 });
 
-// Analyze transcript with Gemini AI
+// Analyze transcript with Gemini AI - FIXED to use gemini-1.5-flash
 app.post('/api/analyze', async (req, res) => {
   const { jobId, customApiKey } = req.body;
   
@@ -178,7 +236,8 @@ app.post('/api/analyze', async (req, res) => {
     // Read transcript
     const transcript = await fs.readFile(job.subtitlesPath, 'utf-8');
 
-    if (transcript.includes('No transcript available')) {
+    // Check if transcript is actually available
+    if (transcript.includes('No transcript available') || transcript.trim().length < 50) {
       // Return default suggestions based on video duration
       const suggestions = generateDefaultSuggestions(job.duration);
       jobs.set(jobId, {
@@ -187,25 +246,36 @@ app.post('/api/analyze', async (req, res) => {
         message: 'Analysis complete (default suggestions)',
         suggestions
       });
-      return res.json({ suggestions });
+      return res.json({ 
+        suggestions,
+        warning: 'No transcript available. Using default time-based suggestions.'
+      });
     }
 
     // Use custom API key if provided, otherwise use server key
     const apiKey = customApiKey || process.env.GEMINI_API_KEY;
+    
+    if (!apiKey) {
+      throw new Error('No Gemini API key available');
+    }
+
+    // FIXED: Use gemini-1.5-flash on stable v1 API
     const ai = new GoogleGenerativeAI(apiKey);
-    const model = ai.getGenerativeModel({ model: 'gemini-pro' });
+    const model = ai.getGenerativeModel({ 
+      model: 'gemini-1.5-flash'  // Updated to stable model
+    });
 
     const prompt = `You are a viral video expert. Analyze this video transcript and suggest 3-5 segments that would make the most engaging short clips for social media (30-90 seconds each).
 
 Video Duration: ${job.duration} seconds
-Transcript: ${transcript.substring(0, 5000)}
+Transcript: ${transcript.substring(0, 8000)}
 
 For each suggested clip, provide:
 1. Start time (in seconds)
-2. End time (in seconds)
+2. End time (in seconds)  
 3. Why this segment is engaging
 
-Format your response as JSON array:
+Format your response as a JSON array ONLY (no additional text):
 [
   {
     "start": <seconds>,
@@ -217,30 +287,49 @@ Format your response as JSON array:
 
 Make sure all timestamps are within the video duration (0 to ${job.duration} seconds) and each clip is between 30-90 seconds.`;
 
-    console.log('🤖 Analyzing with Gemini AI...');
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    const text = response.text();
-
-    // Extract JSON from response
+    console.log('🤖 Analyzing with Gemini AI (gemini-1.5-flash)...');
+    
+    // Robust try-catch for Gemini API call
     let suggestions = [];
     try {
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
+
+      // Extract JSON from response
       const jsonMatch = text.match(/\[[\s\S]*\]/);
       if (jsonMatch) {
         suggestions = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error('No valid JSON found in response');
       }
-    } catch (e) {
-      console.error('Error parsing AI response:', e);
+    } catch (aiError) {
+      console.error('⚠️  Gemini API error:', aiError.message);
+      // Fallback to default suggestions
       suggestions = generateDefaultSuggestions(job.duration);
+      
+      jobs.set(jobId, {
+        ...job,
+        status: 'analyzed',
+        message: 'Analysis complete (default suggestions)',
+        suggestions
+      });
+      
+      return res.json({ 
+        suggestions,
+        warning: 'AI analysis failed. Using default time-based suggestions.'
+      });
     }
 
     // Validate and fix suggestions
-    suggestions = suggestions.map(s => ({
-      start: Math.max(0, Math.min(s.start, job.duration - 30)),
-      end: Math.max(30, Math.min(s.end, job.duration)),
-      duration: s.end - s.start,
-      reason: s.reason || 'Interesting segment'
-    })).filter(s => s.duration >= 30 && s.duration <= 90);
+    suggestions = suggestions
+      .map(s => ({
+        start: Math.max(0, Math.min(s.start || 0, job.duration - 30)),
+        end: Math.max(30, Math.min(s.end || 60, job.duration)),
+        duration: (s.end || 60) - (s.start || 0),
+        reason: s.reason || 'Interesting segment'
+      }))
+      .filter(s => s.duration >= 30 && s.duration <= 90);
 
     if (suggestions.length === 0) {
       suggestions = generateDefaultSuggestions(job.duration);
@@ -258,14 +347,20 @@ Make sure all timestamps are within the video duration (0 to ${job.duration} sec
 
   } catch (error) {
     console.error('❌ Analysis error:', error);
-    const suggestions = generateDefaultSuggestions(job.duration);
+    
+    // ROBUST FALLBACK: Always return default suggestions
+    const suggestions = generateDefaultSuggestions(job.duration || 60);
     jobs.set(jobId, {
       ...job,
       status: 'analyzed',
       message: 'Analysis complete (default suggestions)',
       suggestions
     });
-    res.json({ suggestions, warning: 'AI analysis failed, using default suggestions' });
+    
+    res.json({ 
+      suggestions, 
+      warning: 'AI analysis failed. Using default time-based suggestions.'
+    });
   }
 });
 
@@ -286,20 +381,23 @@ function generateDefaultSuggestions(duration) {
   // Middle clip
   if (duration >= 90) {
     const midPoint = Math.floor(duration / 2);
+    const clipStart = Math.max(0, midPoint - 30);
+    const clipEnd = Math.min(duration, midPoint + 30);
     suggestions.push({
-      start: Math.max(0, midPoint - 30),
-      end: Math.min(duration, midPoint + 30),
-      duration: 60,
+      start: clipStart,
+      end: clipEnd,
+      duration: clipEnd - clipStart,
       reason: 'Middle segment - core content'
     });
   }
 
   // End clip
   if (duration >= 150) {
+    const clipStart = Math.max(0, duration - 60);
     suggestions.push({
-      start: Math.max(0, duration - 60),
+      start: clipStart,
       end: duration,
-      duration: Math.min(60, duration - Math.max(0, duration - 60)),
+      duration: duration - clipStart,
       reason: 'Closing segment - conclusion or CTA'
     });
   }
@@ -307,7 +405,7 @@ function generateDefaultSuggestions(duration) {
   return suggestions;
 }
 
-// Process video with FFmpeg
+// Process video with FFmpeg - FIXED for Windows compatibility
 app.post('/api/process', async (req, res) => {
   const { jobId, startTime, endTime } = req.body;
   
@@ -330,9 +428,18 @@ app.post('/api/process', async (req, res) => {
     const outputPath = path.join(path.dirname(job.videoPath), `clip_${Date.now()}.mp4`);
     const duration = endTime - startTime;
 
+    // Handle Windows paths for FFmpeg
+    const escapedInputPath = process.platform === 'win32' 
+      ? job.videoPath.replace(/\\/g, '/')
+      : job.videoPath;
+    
+    const escapedOutputPath = process.platform === 'win32'
+      ? outputPath.replace(/\\/g, '/')
+      : outputPath;
+
     // Get input video dimensions
-    const probeCmd = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${job.videoPath}"`;
-    const { stdout: dimensions } = await execAsync(probeCmd);
+    const probeCmd = `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${escapedInputPath}"`;
+    const { stdout: dimensions } = await execAsync(probeCmd, { timeout: 30000 });
     const [inputWidth, inputHeight] = dimensions.trim().split('x').map(Number);
 
     // Calculate aspect ratio and padding for 9:16 (1080x1920)
@@ -348,7 +455,6 @@ app.post('/api/process', async (req, res) => {
       const scaledHeight = targetHeight;
       const scaledWidth = Math.round(inputAspect * scaledHeight);
       scaleFilter = `scale=${scaledWidth}:${scaledHeight}`;
-      const padWidth = (scaledWidth - targetWidth) / 2;
       padFilter = `pad=${targetWidth}:${targetHeight}:${Math.round((targetWidth - scaledWidth) / 2)}:0:black`;
     } else {
       // Video is taller or equal to 9:16 - scale to width and add top/bottom padding
@@ -359,7 +465,13 @@ app.post('/api/process', async (req, res) => {
     }
 
     // Add yellow text captions at bottom (viral style)
-    const captionFilter = `drawtext=text='VIRAL CLIP':fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontsize=48:fontcolor=yellow:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-th-100`;
+    // Handle font path for both Windows and Unix
+    let fontPath = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+    if (process.platform === 'win32') {
+      fontPath = 'C\\\\:/Windows/Fonts/Arial.ttf'; // Escaped for FFmpeg on Windows
+    }
+    
+    const captionFilter = `drawtext=text='VIRAL CLIP':fontfile=${fontPath}:fontsize=48:fontcolor=yellow:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-th-100`;
 
     // Combine all filters
     const filterComplex = `${scaleFilter},${padFilter},${captionFilter}`;
@@ -370,9 +482,13 @@ app.post('/api/process', async (req, res) => {
     console.log('Clip duration:', duration, 'seconds');
 
     // FFmpeg command: trim, scale, pad, add captions
-    const ffmpegCmd = `ffmpeg -i "${job.videoPath}" -ss ${startTime} -t ${duration} -vf "${filterComplex}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${outputPath}" -y`;
+    const ffmpegCmd = `ffmpeg -i "${escapedInputPath}" -ss ${startTime} -t ${duration} -vf "${filterComplex}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${escapedOutputPath}" -y`;
     
-    await execAsync(ffmpegCmd, { maxBuffer: 50 * 1024 * 1024 });
+    // 5 minute timeout for processing
+    await execAsync(ffmpegCmd, { 
+      maxBuffer: 100 * 1024 * 1024,
+      timeout: 300000 
+    });
 
     jobs.set(jobId, {
       ...job,
@@ -393,13 +509,13 @@ app.post('/api/process', async (req, res) => {
     jobs.set(jobId, {
       ...job,
       status: 'error',
-      message: error.message
+      message: error.message || 'Video processing failed'
     });
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Video processing failed' });
   }
 });
 
-// Download processed clip
+// Download processed clip with automatic cleanup
 app.get('/api/download-clip/:jobId', async (req, res) => {
   const { jobId } = req.params;
   const job = jobs.get(jobId);
@@ -414,17 +530,8 @@ app.get('/api/download-clip/:jobId', async (req, res) => {
         console.error('Download error:', err);
       } else {
         console.log('✅ Clip downloaded successfully');
-        // Clean up after download
-        setTimeout(async () => {
-          try {
-            const dir = path.dirname(job.outputPath);
-            await fs.rm(dir, { recursive: true, force: true });
-            jobs.delete(jobId);
-            console.log('🗑️  Cleaned up job:', jobId);
-          } catch (error) {
-            console.error('Cleanup error:', error);
-          }
-        }, 5000);
+        // Clean up after download - ENHANCED cleanup
+        setTimeout(() => cleanupJobFolder(jobId), 10000); // 10 seconds after download
       }
     });
   } catch (error) {
@@ -466,7 +573,8 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log('🚀 Video Clipper API running on port', PORT);
     console.log('📁 Temp directory:', TEMP_DIR);
-    console.log('🤖 Gemini API configured');
+    console.log('🤖 Gemini API configured:', !!genAI);
+    console.log('🌐 CORS enabled for: http://localhost:3000');
   });
 }
 
